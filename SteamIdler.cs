@@ -209,6 +209,23 @@ namespace SteamIdler
     }
 
     // =========================================================================
+    //  TimedWebClient – WebClient with a hard request timeout
+    // =========================================================================
+
+    class TimedWebClient : WebClient
+    {
+        /// <summary>Request timeout in milliseconds (default 30 s).</summary>
+        public int TimeoutMs = 30000;
+
+        protected override WebRequest GetWebRequest(Uri address)
+        {
+            WebRequest req = base.GetWebRequest(address);
+            if (req != null) req.Timeout = TimeoutMs;
+            return req;
+        }
+    }
+
+    // =========================================================================
     //  SteamButton – fully custom-drawn button with hover/press states
     // =========================================================================
 
@@ -219,7 +236,7 @@ namespace SteamIdler
         bool _hover, _press;
 
         public void NotifyDefault(bool value) { }
-        public void PerformClick() { OnClick(EventArgs.Empty); }
+        public void PerformClick() { if (Enabled) OnClick(EventArgs.Empty); }
 
         public SteamButton()
         {
@@ -553,12 +570,20 @@ namespace SteamIdler
 
     static class AppConfig
     {
+        // ── Version ──────────────────────────────────────────────────────────
+        public const string AppVersion  = "1.0.0";
+
+        // ── Auth mode identifiers (single source of truth) ────────────────
+        public const string ModeCookies = "cookies";
+        public const string ModeApiKey  = "apikey";
+        public const string ModeManual  = "manual";
+
         static readonly string _dir;
         public static readonly string CacheDir;
         public static readonly string RunDir;
         static readonly string _cfgFile;
 
-        public static string AuthMode    = "cookies";
+        public static string AuthMode    = ModeCookies;
         public static string ApiKey      = "";
         public static string SteamId     = "";
         public static string SessionId   = "";
@@ -644,22 +669,22 @@ namespace SteamIdler
 
     static class BadgeScraper
     {
-        public static async Task<List<BadgeGame>> GetGamesWithDropsAsync(string sessionId, string loginSecure)
+        // onProgress(pageNumber) is called after each page is scraped (may be null).
+        // Network exceptions are intentionally NOT caught here — they propagate to
+        // FetchBadgeMode so the user sees a proper error message.
+        public static async Task<List<BadgeGame>> GetGamesWithDropsAsync(
+            string sessionId, string loginSecure, Action<int> onProgress = null)
         {
             var results = new List<BadgeGame>();
             for (int page = 1; page <= 50; page++)
             {
                 string url  = "https://steamcommunity.com/my/badges/?l=english&p=" + page.ToString();
                 string html;
-                try
-                {
-                    using (var wc = MakeClient(sessionId, loginSecure))
-                        html = await wc.DownloadStringTaskAsync(url);
-                }
-                catch { break; }
+                using (var wc = MakeClient(sessionId, loginSecure))
+                    html = await wc.DownloadStringTaskAsync(url);
 
                 results.AddRange(ParsePage(html));
-
+                if (onProgress != null) onProgress(page);
                 if (!html.Contains("pagebtn_next")) break;  // no more pages
             }
             return results;
@@ -706,9 +731,9 @@ namespace SteamIdler
             return list;
         }
 
-        static WebClient MakeClient(string sid, string sec)
+        static TimedWebClient MakeClient(string sid, string sec)
         {
-            var wc = new WebClient();
+            var wc = new TimedWebClient();
             wc.Headers[HttpRequestHeader.Cookie]    = "sessionid=" + sid + "; steamLoginSecure=" + sec;
             wc.Headers[HttpRequestHeader.UserAgent] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0";
             return wc;
@@ -935,9 +960,9 @@ namespace SteamIdler
             AcceptButton = saveBtn;
             CancelButton = cancelBtn;
 
-            if      (AppConfig.AuthMode == "apikey")  SelectTab(1);
-            else if (AppConfig.AuthMode == "manual")  SelectTab(2);
-            else                                      SelectTab(0);
+            if      (AppConfig.AuthMode == AppConfig.ModeApiKey)  SelectTab(1);
+            else if (AppConfig.AuthMode == AppConfig.ModeManual)  SelectTab(2);
+            else                                                   SelectTab(0);
         }
 
         void SelectTab(int idx)
@@ -985,6 +1010,9 @@ namespace SteamIdler
             clearBtn.Location  = new Point(264, 50);
             clearBtn.Click    += (s, e) =>
             {
+                if (MessageBox.Show("Clear your saved Steam login cookies?\nYou will need to log in again.",
+                        "Forget Login", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                    return;
                 AppConfig.SessionId = AppConfig.LoginSecure = "";
                 UpdateCookieStatus();
             };
@@ -1061,9 +1089,11 @@ namespace SteamIdler
 
         void OnSave(object sender, EventArgs e)
         {
-            string active = _pCookies.Visible ? "cookies" : _pApiKey.Visible ? "apikey" : "manual";
+            string active = _pCookies.Visible ? AppConfig.ModeCookies
+                          : _pApiKey.Visible  ? AppConfig.ModeApiKey
+                          :                     AppConfig.ModeManual;
 
-            if (active == "apikey")
+            if (active == AppConfig.ModeApiKey)
             {
                 ulong dummy;
                 if (string.IsNullOrEmpty(_keyBox.Text.Trim()) || string.IsNullOrEmpty(_sidBox.Text.Trim()))
@@ -1074,7 +1104,7 @@ namespace SteamIdler
                 AppConfig.SteamId  = _sidBox.Text.Trim();
             }
 
-            if (active == "cookies" && !AppConfig.HasCookies())
+            if (active == AppConfig.ModeCookies && !AppConfig.HasCookies())
             {
                 if (MessageBox.Show("You haven't logged in yet. Save anyway?", "Not logged in",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
@@ -1170,7 +1200,7 @@ namespace SteamIdler
         public MainForm()
         {
             _exeDir     = Path.GetDirectoryName(Application.ExecutablePath);
-            Text        = "Steam Card Idler";
+            Text        = "Steam Card Idler  v" + AppConfig.AppVersion;
             Size        = new Size(1000, 740);
             MinimumSize = new Size(820, 560);
             BackColor   = Pal.BgWindow;
@@ -1270,8 +1300,8 @@ namespace SteamIdler
                     g.DrawLine(p, 0, hdr.Height - 1, hdr.Width, hdr.Height - 1);
 
                 // Mode pill
-                string modeText = AppConfig.AuthMode == "cookies" ? "Cookie Login"
-                               : AppConfig.AuthMode == "apikey"   ? "API Key Mode"
+                string modeText = AppConfig.AuthMode == AppConfig.ModeCookies ? "Cookie Login"
+                               : AppConfig.AuthMode == AppConfig.ModeApiKey   ? "API Key Mode"
                                : "Manual Mode";
                 var mr = new RectangleF(188, 22, 100, 20);
                 using (var path = Draw.RoundedRect(mr, 8))
@@ -1488,7 +1518,7 @@ namespace SteamIdler
 
         string GetPlaceholderText()
         {
-            if (AppConfig.AuthMode == "manual")
+            if (AppConfig.AuthMode == AppConfig.ModeManual)
                 return "Manual mode  –  use Quick Idle below to idle any AppID without logging in.";
             return "Click Refresh to load your Steam library.\nMake sure Steam is running.";
         }
@@ -1502,7 +1532,8 @@ namespace SteamIdler
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 AppConfig.Save();
                 _loadingLbl.Text = GetPlaceholderText();
-                Invalidate(true); // repaint mode pill
+                Invalidate(true);  // repaint mode pill
+                RefreshStatus();   // update mode-sensitive buttons (e.g. Idle All Drops)
                 FetchLibrary();
             }
         }
@@ -1511,13 +1542,29 @@ namespace SteamIdler
 
         async void FetchLibrary()
         {
-            if (AppConfig.AuthMode == "manual") return;
+            // Manual mode: show help text and clear any previously loaded library
+            if (AppConfig.AuthMode == AppConfig.ModeManual)
+            {
+                _listPanel.SuspendLayout();
+                foreach (var c in _cards.Values) { _listPanel.Controls.Remove(c); c.Dispose(); }
+                _cards.Clear();
+                _loadingLbl.Text = GetPlaceholderText();
+                if (!_listPanel.Controls.Contains(_loadingLbl))
+                    _listPanel.Controls.Add(_loadingLbl);
+                _listPanel.ResumeLayout(true);
+                UpdateStats();
+                return;
+            }
+
             if (_fetching) return;
             _fetching = true;
             try
             {
                 // Stop any running games before clearing the card list
                 if (_procs.Count > 0) StopAll();
+
+                // Clear stale search filter so all fresh results are visible
+                _search.Text = "";
 
                 _listPanel.SuspendLayout();
                 foreach (var c in _cards.Values) { _listPanel.Controls.Remove(c); c.Dispose(); }
@@ -1529,8 +1576,8 @@ namespace SteamIdler
                 _listPanel.ResumeLayout(true);
                 UpdateStats();
 
-                if      (AppConfig.AuthMode == "cookies") await FetchBadgeMode();
-                else if (AppConfig.AuthMode == "apikey")  await FetchApiMode();
+                if      (AppConfig.AuthMode == AppConfig.ModeCookies) await FetchBadgeMode();
+                else if (AppConfig.AuthMode == AppConfig.ModeApiKey)  await FetchApiMode();
             }
             finally { _fetching = false; }
         }
@@ -1542,8 +1589,14 @@ namespace SteamIdler
 
             try
             {
-                _loadingLbl.Text = "Scraping badge page for games with card drops...";
-                var games = await BadgeScraper.GetGamesWithDropsAsync(AppConfig.SessionId, AppConfig.LoginSecure);
+                _loadingLbl.Text = "Scraping badge pages… (page 1)";
+                var games = await BadgeScraper.GetGamesWithDropsAsync(
+                    AppConfig.SessionId, AppConfig.LoginSecure,
+                    page =>
+                    {
+                        if (!IsDisposed)
+                            _loadingLbl.Text = "Scraping badge pages… (page " + page.ToString() + ")";
+                    });
 
                 _listPanel.SuspendLayout();
                 _listPanel.Controls.Remove(_loadingLbl);
@@ -1568,7 +1621,7 @@ namespace SteamIdler
             }
             catch (Exception ex)
             {
-                _loadingLbl.Text = "Badge page load failed.\n\n" + ex.Message + "\n\nTry logging in again via Settings.";
+                _loadingLbl.Text = "Badge page load failed.\n\n" + HumanizeNetworkError(ex) + "\n\nTry logging in again via Settings.";
                 if (!_listPanel.Controls.Contains(_loadingLbl)) _listPanel.Controls.Add(_loadingLbl);
             }
         }
@@ -1586,7 +1639,7 @@ namespace SteamIdler
                     + "&include_appinfo=1&include_played_free_games=1&format=json";
 
                 string json;
-                using (var wc = new WebClient())
+                using (var wc = new TimedWebClient())
                     json = await wc.DownloadStringTaskAsync(url);
 
                 var gamesToken = JObject.Parse(json)["response"]["games"];
@@ -1625,7 +1678,7 @@ namespace SteamIdler
             }
             catch (Exception ex)
             {
-                _loadingLbl.Text = "Failed to load library.\n\n" + ex.Message + "\n\nCheck Settings.";
+                _loadingLbl.Text = "Failed to load library.\n\n" + HumanizeNetworkError(ex) + "\n\nCheck Settings.";
                 if (!_listPanel.Controls.Contains(_loadingLbl)) _listPanel.Controls.Add(_loadingLbl);
             }
         }
@@ -1645,13 +1698,16 @@ namespace SteamIdler
                         data = File.ReadAllBytes(path);
                     else
                     {
-                        using (var wc = new WebClient())
+                        using (var wc = new TimedWebClient())
                             data = wc.DownloadData("https://cdn.cloudflare.steamstatic.com/steam/apps/"
                                 + appId.ToString() + "/capsule_sm_120.jpg");
                         try { File.WriteAllBytes(path, data); } catch { }
                     }
+                    // Single-decode: Bitmap(Stream) fully decodes JPEG at construction time.
+                    // The previous pattern (new Bitmap(Image.FromStream(...))) created two GDI
+                    // objects and leaked the inner Image on every load.
                     using (var ms = new MemoryStream(data))
-                        return new Bitmap(Image.FromStream(ms));
+                        return new Bitmap(ms);
                 });
                 GameCard card;
                 if (_cards.TryGetValue(appId, out card)) card.SetImage(img);
@@ -1720,7 +1776,7 @@ namespace SteamIdler
                 StartOne(appId);
                 started = true;
             }
-            if (started) { UpdateStats(); RefreshStatus(); }
+            if (started) { _quickBox.Clear(); UpdateStats(); RefreshStatus(); }
         }
 
         // ---- Library idle ---------------------------------------------------
@@ -1793,9 +1849,11 @@ namespace SteamIdler
                 int capturedId = appId;
                 proc.Exited += (s, e) =>
                 {
+                    // Guard: form may already be disposed when a background process exits
+                    if (IsDisposed || !IsHandleCreated) return;
                     BeginInvoke(new Action(() =>
                     {
-                        // Only clean up if we still track this process (not already stopped by user)
+                        // ContainsKey check is inside BeginInvoke (UI thread) to avoid data race
                         if (_procs.ContainsKey(capturedId))
                         {
                             StopOne(capturedId);
@@ -1838,8 +1896,9 @@ namespace SteamIdler
             Process proc;
             if (_procs.TryGetValue(appId, out proc))
             {
-                try { proc.Kill(); } catch { }
+                try { if (!proc.HasExited) proc.Kill(); } catch { }
                 _procs.Remove(appId);
+                try { proc.Dispose(); } catch { }
             }
             GameCard card;
             if (_cards.TryGetValue(appId, out card))
@@ -1869,16 +1928,20 @@ namespace SteamIdler
             _stopBtn.Enabled   = n > 0;
             _stopBtn.Invalidate();
 
-            // Window title
+            // "Idle All Drops" only applies in cookie mode — API mode has no drop-count data
+            _idleDropsBtn.Visible = AppConfig.AuthMode == AppConfig.ModeCookies;
+
+            // Window title — include version when not idling
+            string baseTitle = "Steam Card Idler  v" + AppConfig.AppVersion;
             Text = n > 0
                 ? "Steam Card Idler  —  " + n.ToString() + (n == 1 ? " game idling" : " games idling")
-                : "Steam Card Idler";
+                : baseTitle;
 
             // Tray tooltip (64-char limit enforced by Windows)
             if (_tray != null)
             {
-                string tip  = n > 0 ? "Steam Card Idler — " + n.ToString() + " idling" : "Steam Card Idler";
-                _tray.Text  = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+                string tip = n > 0 ? "Steam Card Idler — " + n.ToString() + " idling" : "Steam Card Idler";
+                _tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
             }
         }
 
@@ -1924,6 +1987,44 @@ namespace SteamIdler
                     ToolTipIcon.Info);
             }
         }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_imgThrottle != null) { _imgThrottle.Dispose(); _imgThrottle = null; }
+                if (_tray        != null) { _tray.Visible = false;  _tray.Dispose(); _tray = null; }
+            }
+            base.Dispose(disposing);
+        }
+
+        // ---- Helpers -------------------------------------------------------
+
+        /// <summary>Converts common WebExceptions into readable one-liners for the UI.</summary>
+        static string HumanizeNetworkError(Exception ex)
+        {
+            var we = ex as WebException;
+            if (we != null)
+            {
+                if (we.Status == WebExceptionStatus.Timeout)
+                    return "Connection timed out. Check your internet connection and try again.";
+                if (we.Status == WebExceptionStatus.NameResolutionFailure)
+                    return "Could not reach Steam servers. Check your internet connection.";
+                if (we.Status == WebExceptionStatus.ProtocolError && we.Response != null)
+                {
+                    var resp = (HttpWebResponse)we.Response;
+                    if (resp.StatusCode == HttpStatusCode.Unauthorized)
+                        return "Login expired (401). Please log in again via Settings.";
+                    if (resp.StatusCode == HttpStatusCode.Forbidden)
+                        return "Access denied (403). Check your credentials in Settings.";
+                    if (resp.StatusCode == HttpStatusCode.ServiceUnavailable)
+                        return "Steam servers are temporarily unavailable (503). Try again in a moment.";
+                    return "Server returned error " + ((int)resp.StatusCode).ToString()
+                         + " — " + resp.StatusDescription;
+                }
+            }
+            return ex.Message;
+        }
     }
 
     // =========================================================================
@@ -1935,6 +2036,37 @@ namespace SteamIdler
         [STAThread]
         static void Main()
         {
+            // ── Single-instance guard ─────────────────────────────────────────
+            bool createdNew;
+            var mutex = new Mutex(true, "SteamCardIdler_SingleInstance", out createdNew);
+            if (!createdNew)
+            {
+                MessageBox.Show(
+                    "Steam Card Idler is already running.\nCheck the system tray.",
+                    "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // ── Global exception handlers ─────────────────────────────────────
+            // Catch unhandled exceptions thrown on the UI thread
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) =>
+            {
+                MessageBox.Show(
+                    "An unexpected error occurred:\n\n" + e.Exception.Message,
+                    "Steam Card Idler — Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            };
+            // Catch unhandled exceptions thrown on background threads
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                var ex  = e.ExceptionObject as Exception;
+                string msg = ex != null ? ex.Message : e.ExceptionObject.ToString();
+                MessageBox.Show(
+                    "A fatal error occurred:\n\n" + msg,
+                    "Steam Card Idler — Fatal Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            };
+
+            // ── Networking ────────────────────────────────────────────────────
             // Steam API and image CDN require TLS 1.2+
             ServicePointManager.SecurityProtocol =
                 SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
@@ -1942,6 +2074,8 @@ namespace SteamIdler
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+
+            GC.KeepAlive(mutex);  // prevent GC from releasing the mutex before app exits
         }
     }
 }
