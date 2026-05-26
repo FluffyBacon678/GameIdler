@@ -1,0 +1,15 @@
+# Normalize all text files to LF in the repo, CRLF on Windows checkout
+* text=auto
+
+# Source / docs / config — explicit
+*.cs       text eol=crlf
+*.bat      text eol=crlf
+*.md       text eol=lf
+.gitignore text eol=lf
+
+# Binaries — never touch
+*.exe      binary
+*.dll      binary
+*.jpg      binary
+*.png      binary
+*.ico      binary

@@ -163,6 +163,9 @@ namespace SteamIdler
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         static extern uint SetThreadExecutionState(uint esFlags);
 
+        [DllImport("user32.dll")]
+        static extern bool SetProcessDPIAware();
+
         public static void PreventSleep()
         {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
@@ -171,6 +174,16 @@ namespace SteamIdler
         public static void AllowSleep()
         {
             SetThreadExecutionState(ES_CONTINUOUS);
+        }
+
+        /// <summary>
+        /// Tells Windows the process handles DPI scaling itself, so the OS does not
+        /// bitmap-stretch the window on high-DPI displays (which causes blurry text).
+        /// Safe to call on Vista+ and ignored on older systems.
+        /// </summary>
+        public static void EnableDpiAwareness()
+        {
+            try { SetProcessDPIAware(); } catch { /* not available on very old OS */ }
         }
     }
 
@@ -309,9 +322,11 @@ namespace SteamIdler
         public  bool   Checked   { get { return _checked; } }
         public  bool   IsRunning { get { return _running;  } }
         public  Action StopAction;
+        public  Action CheckedChanged;   // fired when the checkbox toggles
 
         bool     _checked, _hover, _running;
         Image    _image;
+        bool     _imageFailed;
         double   _pulse;
         bool     _animSubscribed;
         DateTime _startTime;
@@ -337,8 +352,19 @@ namespace SteamIdler
             BackColor = Pal.BgCard;
         }
 
-        public void SetChecked(bool v) { _checked = v;        Invalidate(); }
-        public void ToggleCheck()      { _checked = !_checked; Invalidate(); }
+        public void SetChecked(bool v)
+        {
+            if (_checked == v) return;
+            _checked = v;
+            Invalidate();
+            if (CheckedChanged != null) CheckedChanged();
+        }
+        public void ToggleCheck()
+        {
+            _checked = !_checked;
+            Invalidate();
+            if (CheckedChanged != null) CheckedChanged();
+        }
 
         public void SetImage(Image img)
         {
@@ -346,7 +372,16 @@ namespace SteamIdler
             if (InvokeRequired) { Invoke(new Action<Image>(SetImage), img); return; }
             Image old = _image;
             _image = img;
+            _imageFailed = false;
             if (old != null) old.Dispose();
+            Invalidate();
+        }
+
+        public void MarkImageFailed()
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { Invoke(new Action(MarkImageFailed)); return; }
+            _imageFailed = true;
             Invalidate();
         }
 
@@ -491,7 +526,7 @@ namespace SteamIdler
             var imgRect = new Rectangle(IMG_X, IMG_Y, IMG_W, IMG_H);
             if (_image != null)
             {
-                g.DrawImage(_image, imgRect);
+                try { g.DrawImage(_image, imgRect); } catch { /* image disposed by race — ignore */ }
             }
             else
             {
@@ -500,7 +535,8 @@ namespace SteamIdler
                 using (var sf = new StringFormat { Alignment = StringAlignment.Center,
                                                    LineAlignment = StringAlignment.Center })
                 using (var br = new SolidBrush(Pal.TxtDim))
-                    g.DrawString("loading...", Fnt.CardSub, br, (RectangleF)imgRect, sf);
+                    g.DrawString(_imageFailed ? "no image" : "loading...",
+                                 Fnt.CardSub, br, (RectangleF)imgRect, sf);
             }
             using (var pen = new Pen(Color.FromArgb(35, 255, 255, 255), 1))
                 g.DrawRectangle(pen, imgRect);
@@ -1221,17 +1257,19 @@ namespace SteamIdler
 
             InitTray();
 
-            // Set placeholder (cue-banner) text — requires control handles to exist
+            // Defer placeholder text + first-fetch until the form handle exists.
+            // Calling BeginInvoke from the constructor (before handle creation) throws.
             Load += (s, e) =>
             {
                 SetPlaceholder(_search,   "Search games...");
                 SetPlaceholder(_quickBox, "e.g.  431960  or  431960, 570, 1091500");
-            };
 
-            if (!AppConfig.HasCookies() && !AppConfig.HasApiKey() && AppConfig.AuthMode != "manual")
-                BeginInvoke(new Action(OpenSettings));
-            else
-                BeginInvoke(new Action(FetchLibrary));
+                if (!AppConfig.HasCookies() && !AppConfig.HasApiKey()
+                    && AppConfig.AuthMode != AppConfig.ModeManual)
+                    BeginInvoke(new Action(OpenSettings));
+                else
+                    BeginInvoke(new Action(FetchLibrary));
+            };
         }
 
         // ---- Tray icon ------------------------------------------------------
@@ -1604,6 +1642,7 @@ namespace SteamIdler
                 foreach (var g in games)
                 {
                     var card         = new GameCard(g.AppId, g.Name, g.PlaytimeMinutes, g.RemainingDrops);
+                    card.CheckedChanged = UpdateStats;
                     _cards[g.AppId]  = card;
                     _listPanel.Controls.Add(card);
                     int id = g.AppId;
@@ -1662,6 +1701,7 @@ namespace SteamIdler
                     string name = (string)g["name"] ?? ("App " + aid.ToString());
                     int    mins = g["playtime_forever"] != null ? (int)g["playtime_forever"] : 0;
                     var card    = new GameCard(aid, name, mins, 0);
+                    card.CheckedChanged = UpdateStats;
                     _cards[aid] = card;
                     _listPanel.Controls.Add(card);
                     int id = aid;
@@ -1713,7 +1753,12 @@ namespace SteamIdler
                 if (_cards.TryGetValue(appId, out card)) card.SetImage(img);
                 else img.Dispose();
             }
-            catch { }
+            catch
+            {
+                // Image download or decode failed — mark the card so "loading..." doesn't linger forever
+                GameCard card;
+                if (_cards.TryGetValue(appId, out card)) card.MarkImageFailed();
+            }
             finally { _imgThrottle.Release(); }
         }
 
@@ -1730,22 +1775,32 @@ namespace SteamIdler
 
         void SetAllChecked(bool v)
         {
+            // Detach the per-card UpdateStats hook during bulk change, then fire once at the end
             foreach (var c in _cards.Values)
-                if (c.Visible) c.SetChecked(v);
+            {
+                if (!c.Visible) continue;
+                var saved = c.CheckedChanged;
+                c.CheckedChanged = null;
+                c.SetChecked(v);
+                c.CheckedChanged = saved;
+            }
+            UpdateStats();
         }
 
         void UpdateStats()
         {
-            int total   = _cards.Count;
-            int drops   = _cards.Values.Count(c => c.RemainingDrops > 0);
-            int running = _procs.Count;
+            int total    = _cards.Count;
+            int drops    = _cards.Values.Count(c => c.RemainingDrops > 0);
+            int selected = _cards.Values.Count(c => c.Checked);
+            int running  = _procs.Count;
 
             if (total == 0 && running == 0)
             { _statsLbl.Text = "No library loaded"; return; }
 
             string t = total.ToString() + " games";
-            if (drops   > 0) t += "  ·  " + drops.ToString()   + " with card drops";
-            if (running > 0) t += "  ·  " + running.ToString() + " currently idling";
+            if (drops    > 0) t += "  ·  " + drops.ToString()    + " with card drops";
+            if (selected > 0) t += "  ·  " + selected.ToString() + " selected";
+            if (running  > 0) t += "  ·  " + running.ToString()  + " currently idling";
             _statsLbl.Text = t;
         }
 
@@ -1768,6 +1823,7 @@ namespace SteamIdler
                 if (!_cards.ContainsKey(appId))
                 {
                     var card      = new GameCard(appId, "App " + appId.ToString(), 0, 0);
+                    card.CheckedChanged = UpdateStats;
                     _cards[appId] = card;
                     _listPanel.Controls.Add(card);
                     int id = appId;
@@ -2065,6 +2121,11 @@ namespace SteamIdler
                     "A fatal error occurred:\n\n" + msg,
                     "Steam Card Idler — Fatal Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             };
+
+            // ── DPI awareness ─────────────────────────────────────────────────
+            // Must be called BEFORE any window is created. Prevents Windows from
+            // bitmap-stretching the form on high-DPI displays (which blurs text).
+            SystemHelper.EnableDpiAwareness();
 
             // ── Networking ────────────────────────────────────────────────────
             // Steam API and image CDN require TLS 1.2+
