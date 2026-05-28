@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>SteamIdler</AssemblyName>
+    <RootNamespace>SteamIdler</RootNamespace>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>5</LangVersion>
+    <Nullable>disable</Nullable>
+    <Optimize>true</Optimize>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+  <!--
+    References local DLLs that ship alongside the exe.
+    build.bat still works for quick builds without the .NET SDK.
+    This .csproj is for VS / VS Code IntelliSense and GitHub Actions.
+  -->
+  <ItemGroup>
+    <Reference Include="HtmlAgilityPack">
+      <HintPath>HtmlAgilityPack.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>Newtonsoft.Json.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
