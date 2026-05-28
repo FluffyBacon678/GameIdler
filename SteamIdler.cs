@@ -624,6 +624,7 @@ namespace SteamIdler
         public static string SteamId     = "";
         public static string SessionId   = "";
         public static string LoginSecure = "";
+        public static bool   AutoStop    = false;
 
         static AppConfig()
         {
@@ -650,6 +651,7 @@ namespace SteamIdler
                     case "SteamId":     SteamId     = p[1]; break;
                     case "SessionId":   SessionId   = p[1]; break;
                     case "LoginSecure": LoginSecure = p[1]; break;
+                    case "AutoStop":    AutoStop    = p[1] == "1"; break;
                 }
             }
         }
@@ -662,6 +664,7 @@ namespace SteamIdler
                 "SteamId="     + SteamId,
                 "SessionId="   + SessionId,
                 "LoginSecure=" + LoginSecure,
+                "AutoStop="    + (AutoStop ? "1" : "0"),
             });
         }
 
@@ -724,6 +727,29 @@ namespace SteamIdler
                 if (!html.Contains("pagebtn_next")) break;  // no more pages
             }
             return results;
+        }
+
+        /// <summary>
+        /// Scrapes the card page for a single game and returns its remaining drop count.
+        /// Returns 0 when the page cannot be parsed or the game has no drops left.
+        /// </summary>
+        public static async Task<int> GetRemainingDropsForGameAsync(
+            int appId, string sessionId, string loginSecure)
+        {
+            string url = "https://steamcommunity.com/my/gamecards/" + appId.ToString() + "/";
+            string html;
+            using (var wc = MakeClient(sessionId, loginSecure))
+                html = await wc.DownloadStringTaskAsync(url);
+
+            var doc = new HtmlAgilityPack.HtmlDocument();
+            doc.LoadHtml(html);
+            var node = doc.DocumentNode
+                .SelectSingleNode("//span[contains(@class,'progress_info_bold')]");
+            if (node == null) return 0;
+            string text = node.InnerText.Trim();
+            if (!text.Contains("drop")) return 0;
+            int drops;
+            return int.TryParse(Regex.Match(text, @"\d+").Value, out drops) ? drops : 0;
         }
 
         static List<BadgeGame> ParsePage(string html)
@@ -1213,14 +1239,23 @@ namespace SteamIdler
         SteamButton _runBtn, _stopBtn, _idleDropsBtn;
         TextBox     _quickBox;
         NotifyIcon  _tray;
+        CheckBox    _autoStopChk;   // visible only in cookie mode
+        ComboBox    _sortBox;
 
         // State
-        Dictionary<int, GameCard> _cards       = new Dictionary<int, GameCard>();
-        Dictionary<int, Process>  _procs       = new Dictionary<int, Process>();
+        Dictionary<int, GameCard> _cards        = new Dictionary<int, GameCard>();
+        Dictionary<int, Process>  _procs        = new Dictionary<int, Process>();
         SemaphoreSlim             _imgThrottle  = new SemaphoreSlim(8);
-        string _exeDir;
-        bool   _preventedSleep;
-        bool   _fetching;
+        List<int>                 _defaultOrder = new List<int>(); // load order for sort=Default
+        string    _exeDir;
+        bool      _preventedSleep;
+        bool      _fetching;
+        int       _sortMode;        // 0=Default 1=Drops↓ 2=A→Z 3=Z→A 4=Time↑ 5=Time↓
+        DateTime? _sessionStart;    // when the current idle session began
+
+        // Timers
+        System.Windows.Forms.Timer _sessionTimer;   // updates stats every second while idling
+        System.Windows.Forms.Timer _autoStopTimer;  // re-checks drops every 10 min while idling
 
         // Win32: cue-banner (placeholder) text for TextBox controls
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -1373,14 +1408,31 @@ namespace SteamIdler
             settingsBtn.Anchor    = AnchorStyles.Right | AnchorStyles.Top;
             settingsBtn.Click    += (s, e) => OpenSettings();
 
+            _sortBox                   = new ComboBox();
+            _sortBox.DropDownStyle     = ComboBoxStyle.DropDownList;
+            _sortBox.FlatStyle         = FlatStyle.Flat;
+            _sortBox.BackColor         = Pal.BgInput;
+            _sortBox.ForeColor         = Pal.TxtPri;
+            _sortBox.Font              = Fnt.Label;
+            _sortBox.Width             = 138;
+            _sortBox.Items.AddRange(new object[] {
+                "Sort: Default", "Sort: Drops ↓",
+                "Sort: A → Z",  "Sort: Z → A",
+                "Sort: Time ↑", "Sort: Time ↓" });
+            _sortBox.SelectedIndex          = 0;
+            _sortBox.SelectedIndexChanged  += (s, e) => { _sortMode = _sortBox.SelectedIndex; ApplySort(); };
+
             hdr.Resize += (s, e) =>
             {
                 settingsBtn.Location = new Point(hdr.Width - settingsBtn.Width - 14, 17);
                 refreshBtn.Location  = new Point(settingsBtn.Left - refreshBtn.Width - 6, 17);
                 _search.Location     = new Point(refreshBtn.Left - _search.Width - 10, 19);
                 _search.Height       = 26;
+                _sortBox.Location    = new Point(_search.Left - _sortBox.Width - 8, 19);
+                _sortBox.Height      = 26;
             };
             hdr.Controls.Add(_search);
+            hdr.Controls.Add(_sortBox);
             hdr.Controls.Add(refreshBtn);
             hdr.Controls.Add(settingsBtn);
 
@@ -1518,6 +1570,26 @@ namespace SteamIdler
             _idleDropsBtn.Location  = new Point(200, 12);
             _idleDropsBtn.Click    += (s, e) => IdleAllDrops();
 
+            _autoStopChk                              = new CheckBox();
+            _autoStopChk.Text                         = "Auto-stop when drops finish";
+            _autoStopChk.FlatStyle                    = FlatStyle.Flat;
+            _autoStopChk.FlatAppearance.BorderColor   = Pal.Separator;
+            _autoStopChk.FlatAppearance.CheckedBackColor = Color.FromArgb(40, Pal.Accent.R, Pal.Accent.G, Pal.Accent.B);
+            _autoStopChk.FlatAppearance.MouseOverBackColor = Color.FromArgb(20, 255, 255, 255);
+            _autoStopChk.ForeColor                    = Pal.TxtPri;
+            _autoStopChk.BackColor                    = Color.Transparent;
+            _autoStopChk.Font                         = Fnt.Label;
+            _autoStopChk.Location                     = new Point(328, 15);
+            _autoStopChk.AutoSize                     = true;
+            _autoStopChk.Checked                      = AppConfig.AutoStop;
+            _autoStopChk.Visible                      = AppConfig.AuthMode == AppConfig.ModeCookies;
+            _autoStopChk.CheckedChanged              += (s, e) =>
+            {
+                AppConfig.AutoStop = _autoStopChk.Checked;
+                AppConfig.Save();
+                RefreshStatus();
+            };
+
             _runBtn           = new SteamButton();
             _runBtn.Text      = "Run Selected";
             _runBtn.BaseColor = Pal.BtnGreen;
@@ -1542,11 +1614,21 @@ namespace SteamIdler
             actRow.Controls.Add(selAll);
             actRow.Controls.Add(clrAll);
             actRow.Controls.Add(_idleDropsBtn);
+            actRow.Controls.Add(_autoStopChk);
             actRow.Controls.Add(_runBtn);
             actRow.Controls.Add(_stopBtn);
 
             btm.Controls.Add(actRow);
             btm.Controls.Add(quickRow);
+
+            // ── Timers ────────────────────────────────────────────────────────
+            _sessionTimer          = new System.Windows.Forms.Timer();
+            _sessionTimer.Interval = 1000;                // tick every second while idling
+            _sessionTimer.Tick    += (s, e) => { if (_procs.Count > 0) UpdateStats(); };
+
+            _autoStopTimer          = new System.Windows.Forms.Timer();
+            _autoStopTimer.Interval = 10 * 60 * 1000;    // re-check drops every 10 minutes
+            _autoStopTimer.Tick    += (s, e) => CheckDropsAndAutoStop();
 
             Controls.Add(_listPanel);
             Controls.Add(statsBar);
@@ -1586,6 +1668,7 @@ namespace SteamIdler
                 _listPanel.SuspendLayout();
                 foreach (var c in _cards.Values) { _listPanel.Controls.Remove(c); c.Dispose(); }
                 _cards.Clear();
+                _defaultOrder.Clear();
                 _loadingLbl.Text = GetPlaceholderText();
                 if (!_listPanel.Controls.Contains(_loadingLbl))
                     _listPanel.Controls.Add(_loadingLbl);
@@ -1607,6 +1690,7 @@ namespace SteamIdler
                 _listPanel.SuspendLayout();
                 foreach (var c in _cards.Values) { _listPanel.Controls.Remove(c); c.Dispose(); }
                 _cards.Clear();
+                _defaultOrder.Clear();
 
                 _loadingLbl.Text = "Loading library...";
                 if (!_listPanel.Controls.Contains(_loadingLbl))
@@ -1644,11 +1728,13 @@ namespace SteamIdler
                     var card         = new GameCard(g.AppId, g.Name, g.PlaytimeMinutes, g.RemainingDrops);
                     card.CheckedChanged = UpdateStats;
                     _cards[g.AppId]  = card;
+                    _defaultOrder.Add(g.AppId);
                     _listPanel.Controls.Add(card);
                     int id = g.AppId;
                     var _ = LoadImageAsync(id);
                 }
 
+                ApplySort();
                 _listPanel.ResumeLayout(true);
 
                 if (games.Count == 0)
@@ -1703,11 +1789,13 @@ namespace SteamIdler
                     var card    = new GameCard(aid, name, mins, 0);
                     card.CheckedChanged = UpdateStats;
                     _cards[aid] = card;
+                    _defaultOrder.Add(aid);
                     _listPanel.Controls.Add(card);
                     int id = aid;
                     var _ = LoadImageAsync(id);
                 }
 
+                ApplySort();
                 _listPanel.ResumeLayout(true);
                 if (sorted.Count == 0)
                 {
@@ -1801,6 +1889,14 @@ namespace SteamIdler
             if (drops    > 0) t += "  ·  " + drops.ToString()    + " with card drops";
             if (selected > 0) t += "  ·  " + selected.ToString() + " selected";
             if (running  > 0) t += "  ·  " + running.ToString()  + " currently idling";
+            if (running  > 0 && _sessionStart.HasValue)
+            {
+                var span = DateTime.Now - _sessionStart.Value;
+                string sess = span.TotalHours >= 1
+                    ? string.Format("{0}h {1:D2}m", (int)span.TotalHours, span.Minutes)
+                    : string.Format("{0}m {1:D2}s", (int)span.TotalMinutes, span.Seconds);
+                t += "  ·  Session: " + sess;
+            }
             _statsLbl.Text = t;
         }
 
@@ -1920,6 +2016,7 @@ namespace SteamIdler
                 };
 
                 _procs[appId] = proc;
+                if (_procs.Count == 1) _sessionStart = DateTime.Now;  // first game — start session clock
 
                 GameCard card;
                 if (_cards.TryGetValue(appId, out card))
@@ -1954,6 +2051,7 @@ namespace SteamIdler
             {
                 try { if (!proc.HasExited) proc.Kill(); } catch { }
                 _procs.Remove(appId);
+                if (_procs.Count == 0) _sessionStart = null;  // last game — end session clock
                 try { proc.Dispose(); } catch { }
             }
             GameCard card;
@@ -1999,6 +2097,28 @@ namespace SteamIdler
                 string tip = n > 0 ? "Steam Card Idler — " + n.ToString() + " idling" : "Steam Card Idler";
                 _tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
             }
+
+            // Session timer: tick only while at least one game is running
+            if (_sessionTimer != null)
+            {
+                if (n > 0 && !_sessionTimer.Enabled) _sessionTimer.Start();
+                else if (n == 0 && _sessionTimer.Enabled) _sessionTimer.Stop();
+            }
+
+            // Auto-stop timer: run when the checkbox is on AND games are running AND cookie mode
+            bool shouldAutoStop = _autoStopChk != null && _autoStopChk.Checked
+                                && n > 0
+                                && AppConfig.AuthMode == AppConfig.ModeCookies
+                                && AppConfig.HasCookies();
+            if (_autoStopTimer != null)
+            {
+                if (shouldAutoStop  && !_autoStopTimer.Enabled) _autoStopTimer.Start();
+                else if (!shouldAutoStop && _autoStopTimer.Enabled) _autoStopTimer.Stop();
+            }
+
+            // Auto-stop checkbox is only meaningful in cookie mode
+            if (_autoStopChk != null)
+                _autoStopChk.Visible = AppConfig.AuthMode == AppConfig.ModeCookies;
         }
 
         bool CheckIdleExe()
@@ -2048,13 +2168,110 @@ namespace SteamIdler
         {
             if (disposing)
             {
-                if (_imgThrottle != null) { _imgThrottle.Dispose(); _imgThrottle = null; }
-                if (_tray        != null) { _tray.Visible = false;  _tray.Dispose(); _tray = null; }
+                if (_imgThrottle   != null) { _imgThrottle.Dispose();   _imgThrottle   = null; }
+                if (_tray          != null) { _tray.Visible = false;    _tray.Dispose();         _tray          = null; }
+                if (_sessionTimer  != null) { _sessionTimer.Stop();     _sessionTimer.Dispose(); _sessionTimer  = null; }
+                if (_autoStopTimer != null) { _autoStopTimer.Stop();    _autoStopTimer.Dispose(); _autoStopTimer = null; }
             }
             base.Dispose(disposing);
         }
 
         // ---- Helpers -------------------------------------------------------
+
+        // ---- Sort ------------------------------------------------------------------
+
+        void ApplySort()
+        {
+            if (_cards.Count == 0) return;
+
+            var all = _cards.Values.ToList();
+
+            switch (_sortMode)
+            {
+                case 1: // Drops ↓
+                    all = all.OrderByDescending(c => c.RemainingDrops)
+                             .ThenBy(c => c.GameName, StringComparer.OrdinalIgnoreCase).ToList();
+                    break;
+                case 2: // A → Z
+                    all = all.OrderBy(c => c.GameName, StringComparer.OrdinalIgnoreCase).ToList();
+                    break;
+                case 3: // Z → A
+                    all = all.OrderByDescending(c => c.GameName, StringComparer.OrdinalIgnoreCase).ToList();
+                    break;
+                case 4: // Playtime ↑
+                    all = all.OrderBy(c => c.PlaytimeMin)
+                             .ThenBy(c => c.GameName, StringComparer.OrdinalIgnoreCase).ToList();
+                    break;
+                case 5: // Playtime ↓
+                    all = all.OrderByDescending(c => c.PlaytimeMin)
+                             .ThenBy(c => c.GameName, StringComparer.OrdinalIgnoreCase).ToList();
+                    break;
+                default: // Default — restore load order; cards not in _defaultOrder go to the bottom
+                    var rank = new Dictionary<int, int>();
+                    for (int i = 0; i < _defaultOrder.Count; i++) rank[_defaultOrder[i]] = i;
+                    all = all.OrderBy(c => rank.ContainsKey(c.AppId) ? rank[c.AppId] : int.MaxValue).ToList();
+                    break;
+            }
+
+            _listPanel.SuspendLayout();
+            // Remove and re-add in desired order; Controls[0] = top with DockStyle.Top
+            foreach (var c in all) _listPanel.Controls.Remove(c);
+            foreach (var c in all) _listPanel.Controls.Add(c);
+            _listPanel.ResumeLayout(true);
+        }
+
+        // ---- Auto-stop (re-checks drops while idling) --------------------------------
+
+        async void CheckDropsAndAutoStop()
+        {
+            if (!AppConfig.AutoStop
+                || _procs.Count == 0
+                || AppConfig.AuthMode != AppConfig.ModeCookies
+                || !AppConfig.HasCookies()) return;
+
+            var runningIds = _procs.Keys.ToList();
+            var stoppedNames = new List<string>();
+
+            foreach (int appId in runningIds)
+            {
+                if (!_procs.ContainsKey(appId) || IsDisposed) continue;
+                try
+                {
+                    int drops = await BadgeScraper.GetRemainingDropsForGameAsync(
+                        appId, AppConfig.SessionId, AppConfig.LoginSecure);
+
+                    if (IsDisposed) return;
+
+                    // Update the card's displayed drop count
+                    GameCard card;
+                    if (_cards.TryGetValue(appId, out card))
+                    {
+                        card.RemainingDrops = drops;
+                        if (!card.IsDisposed) card.Invalidate();
+                    }
+
+                    // Stop if drops have reached zero
+                    if (drops == 0 && _procs.ContainsKey(appId))
+                    {
+                        string name = (card != null) ? card.GameName : "App " + appId.ToString();
+                        StopOne(appId);
+                        stoppedNames.Add(name);
+                    }
+                }
+                catch { /* network hiccup — skip this game, retry next interval */ }
+            }
+
+            if (stoppedNames.Count > 0 && _tray != null)
+            {
+                string names = string.Join(", ", stoppedNames.ToArray());
+                _tray.ShowBalloonTip(5000, "Card drops finished",
+                    names + (stoppedNames.Count == 1 ? " has" : " have")
+                    + " no drops remaining — stopped idling.",
+                    ToolTipIcon.Info);
+            }
+
+            if (stoppedNames.Count > 0) { UpdateStats(); RefreshStatus(); }
+        }
 
         /// <summary>Converts common WebExceptions into readable one-liners for the UI.</summary>
         static string HumanizeNetworkError(Exception ex)
