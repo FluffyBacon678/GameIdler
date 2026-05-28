@@ -239,6 +239,179 @@ namespace SteamIdler
     }
 
     // =========================================================================
+    //  DarkDialog – dark-themed replacement for MessageBox
+    // =========================================================================
+
+    class DarkDialog : Form
+    {
+        // ── Shared fonts (allocated once) ────────────────────────────────────
+        static readonly Font _msgFont   = new Font("Segoe UI", 9.5f);
+        static readonly Font _hdrFont   = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+        // ── Static Show helpers (mirror the MessageBox.Show overloads used here) ──
+
+        public static DialogResult Show(IWin32Window owner, string msg, string title,
+            MessageBoxButtons btns = MessageBoxButtons.OK,
+            MessageBoxIcon    icon = MessageBoxIcon.None)
+        {
+            using (var d = new DarkDialog(msg, title, btns, icon))
+                return owner != null ? d.ShowDialog(owner) : d.ShowDialog();
+        }
+
+        public static DialogResult Show(string msg, string title,
+            MessageBoxButtons btns, MessageBoxIcon icon)
+        { return Show(null, msg, title, btns, icon); }
+
+        public static DialogResult Show(string msg, string title, MessageBoxButtons btns)
+        { return Show(null, msg, title, btns, MessageBoxIcon.None); }
+
+        public static DialogResult Show(string msg, string title)
+        { return Show(null, msg, title, MessageBoxButtons.OK, MessageBoxIcon.None); }
+
+        // ── Constructor ──────────────────────────────────────────────────────
+
+        DarkDialog(string msg, string title, MessageBoxButtons btns, MessageBoxIcon icon)
+        {
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox     = false;
+            MinimizeBox     = false;
+            ShowInTaskbar   = false;
+            StartPosition   = FormStartPosition.CenterParent;
+            BackColor       = Pal.BgWindow;
+            ForeColor       = Pal.TxtPri;
+            Font            = Fnt.Label;
+            Text            = string.IsNullOrEmpty(title) ? "Steam Card Idler" : title;
+            Width           = 440;
+
+            // ── Header ───────────────────────────────────────────────────────
+            var hdr       = new Panel();
+            hdr.Dock      = DockStyle.Top;
+            hdr.Height    = 52;
+            hdr.BackColor = Pal.BgBar;
+            hdr.Paint    += (s, e) =>
+            {
+                var g = e.Graphics;
+                Draw.SetHQ(g);
+                string glyph = GlyphFor(icon);
+                Color  gc    = ColorFor(icon);
+                float  tx    = 16f;
+                if (glyph != null)
+                {
+                    using (var br = new SolidBrush(gc))
+                    using (var f  = new Font("Segoe UI", 16f))
+                        g.DrawString(glyph, f, br, 14, 14);
+                    tx = 46f;
+                }
+                using (var br = new SolidBrush(Pal.TxtPri))
+                    g.DrawString(string.IsNullOrEmpty(title) ? "Steam Card Idler" : title,
+                        _hdrFont, br, tx, 19);
+                using (var p = new Pen(Pal.Separator, 1))
+                    g.DrawLine(p, 0, hdr.Height - 1, hdr.Width, hdr.Height - 1);
+            };
+
+            // ── Message ───────────────────────────────────────────────────────
+            var lbl            = new Label();
+            lbl.Text           = msg;
+            lbl.Font           = _msgFont;
+            lbl.ForeColor      = Pal.TxtPri;
+            lbl.BackColor      = Color.Transparent;
+            lbl.Dock           = DockStyle.Fill;
+            lbl.AutoSize       = false;
+            lbl.Padding        = new Padding(20, 14, 20, 10);
+
+            // ── Footer with buttons ───────────────────────────────────────────
+            var footer       = new Panel();
+            footer.Dock      = DockStyle.Bottom;
+            footer.Height    = 54;
+            footer.BackColor = Pal.BgBar;
+            footer.Paint    += (s, e) =>
+            {
+                using (var p = new Pen(Pal.Separator, 1))
+                    e.Graphics.DrawLine(p, 0, 0, footer.Width, 0);
+            };
+
+            // Build buttons right-to-left: primary action rightmost
+            var defs = ButtonDefs(btns);
+            var created = new List<SteamButton>();
+            foreach (var def in defs)
+            {
+                var b           = new SteamButton();
+                b.Text          = def.Item1;
+                b.BaseColor     = def.Item3 ? Pal.BtnBlue : Pal.BtnGray;
+                b.Size          = new Size(90, 30);
+                b.Anchor        = AnchorStyles.Right | AnchorStyles.Top;
+                b.DialogResult  = def.Item2;
+                DialogResult dr = def.Item2;
+                b.Click        += (s, e) => { DialogResult = dr; Close(); };
+                if (def.Item3) AcceptButton = b;
+                if (dr == DialogResult.Cancel || dr == DialogResult.No) CancelButton = b;
+                footer.Controls.Add(b);
+                created.Add(b);
+            }
+            footer.Resize += (s, e) =>
+            {
+                int x = footer.Width - 12;
+                foreach (var b in created) { x -= b.Width; b.Location = new Point(x, 12); x -= 8; }
+            };
+
+            Controls.Add(lbl);
+            Controls.Add(hdr);
+            Controls.Add(footer);
+
+            // Size height to fit the message text
+            var measured = TextRenderer.MeasureText(msg, _msgFont,
+                new Size(400, int.MaxValue), TextFormatFlags.WordBreak);
+            Height = Math.Max(170, measured.Height + 52 + 54 + 42 /*chrome*/);
+        }
+
+        // ── Helpers ──────────────────────────────────────────────────────────
+
+        // Returns (label, result, isPrimary) in right-to-left order (rightmost = primary)
+        static List<Tuple<string, DialogResult, bool>> ButtonDefs(MessageBoxButtons btns)
+        {
+            var L = new List<Tuple<string, DialogResult, bool>>();
+            switch (btns)
+            {
+                case MessageBoxButtons.OKCancel:
+                    L.Add(Tuple.Create("OK",     DialogResult.OK,     true));
+                    L.Add(Tuple.Create("Cancel", DialogResult.Cancel, false)); break;
+                case MessageBoxButtons.YesNo:
+                    L.Add(Tuple.Create("Yes", DialogResult.Yes, true));
+                    L.Add(Tuple.Create("No",  DialogResult.No,  false)); break;
+                case MessageBoxButtons.YesNoCancel:
+                    L.Add(Tuple.Create("Yes",    DialogResult.Yes,    true));
+                    L.Add(Tuple.Create("No",     DialogResult.No,     false));
+                    L.Add(Tuple.Create("Cancel", DialogResult.Cancel, false)); break;
+                default:
+                    L.Add(Tuple.Create("OK", DialogResult.OK, true)); break;
+            }
+            return L;
+        }
+
+        static string GlyphFor(MessageBoxIcon icon)
+        {
+            switch (icon)
+            {
+                case MessageBoxIcon.Information: return "ℹ";
+                case MessageBoxIcon.Warning:     return "⚠";
+                case MessageBoxIcon.Error:       return "✖";
+                case MessageBoxIcon.Question:    return "?";
+                default: return null;
+            }
+        }
+
+        static Color ColorFor(MessageBoxIcon icon)
+        {
+            switch (icon)
+            {
+                case MessageBoxIcon.Warning:  return Pal.Orange;
+                case MessageBoxIcon.Error:    return Pal.Red;
+                default:                      return Pal.Accent;
+            }
+        }
+    }
+
+    // =========================================================================
     //  SteamButton – fully custom-drawn button with hover/press states
     // =========================================================================
 
@@ -607,7 +780,7 @@ namespace SteamIdler
     static class AppConfig
     {
         // ── Version ──────────────────────────────────────────────────────────
-        public const string AppVersion  = "1.0.0";
+        public const string AppVersion  = "1.1.0";
 
         // ── Auth mode identifiers (single source of truth) ────────────────
         public const string ModeCookies = "cookies";
@@ -1072,7 +1245,7 @@ namespace SteamIdler
             clearBtn.Location  = new Point(264, 50);
             clearBtn.Click    += (s, e) =>
             {
-                if (MessageBox.Show("Clear your saved Steam login cookies?\nYou will need to log in again.",
+                if (DarkDialog.Show(this, "Clear your saved Steam login cookies?\nYou will need to log in again.",
                         "Forget Login", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                     return;
                 AppConfig.SessionId = AppConfig.LoginSecure = "";
@@ -1107,7 +1280,7 @@ namespace SteamIdler
                 if (!string.IsNullOrEmpty(id))
                     _sidBox.Text = id;
                 else
-                    MessageBox.Show("Steam not running or user not detected.\nFind yours at steamidfinder.com",
+                    DarkDialog.Show(this, "Steam not running or user not detected.\nFind yours at steamidfinder.com",
                         "Not found", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
 
@@ -1168,7 +1341,7 @@ namespace SteamIdler
 
             if (active == AppConfig.ModeCookies && !AppConfig.HasCookies())
             {
-                if (MessageBox.Show("You haven't logged in yet. Save anyway?", "Not logged in",
+                if (DarkDialog.Show(this, "You haven't logged in yet. Save anyway?", "Not logged in",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
                 { DialogResult = DialogResult.None; return; }
             }
@@ -1178,7 +1351,7 @@ namespace SteamIdler
 
         void Warn(string msg)
         {
-            MessageBox.Show(msg, "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            DarkDialog.Show(this, msg, "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         SteamButton MakeTabBtn(string text)
@@ -1242,6 +1415,11 @@ namespace SteamIdler
         CheckBox    _autoStopChk;   // visible only in cookie mode
         ComboBox    _sortBox;
 
+        // Error panel (shown instead of _loadingLbl on fetch failure)
+        Panel       _errorPanel;
+        Label       _errorMsgLbl;
+        SteamButton _retryBtn;
+
         // State
         Dictionary<int, GameCard> _cards        = new Dictionary<int, GameCard>();
         Dictionary<int, Process>  _procs        = new Dictionary<int, Process>();
@@ -1252,6 +1430,7 @@ namespace SteamIdler
         bool      _fetching;
         int       _sortMode;        // 0=Default 1=Drops↓ 2=A→Z 3=Z→A 4=Time↑ 5=Time↓
         DateTime? _sessionStart;    // when the current idle session began
+        DateTime? _nextAutoStopCheck; // when the auto-stop timer next fires
 
         // Timers
         System.Windows.Forms.Timer _sessionTimer;   // updates stats every second while idling
@@ -1621,6 +1800,43 @@ namespace SteamIdler
             btm.Controls.Add(actRow);
             btm.Controls.Add(quickRow);
 
+            // ── Error panel (replaces _loadingLbl on fetch failure) ───────────
+            _errorPanel            = new Panel();
+            _errorPanel.Dock       = DockStyle.Fill;
+            _errorPanel.BackColor  = Pal.BgWindow;
+            _errorPanel.Visible    = false;
+
+            _errorMsgLbl           = new Label();
+            _errorMsgLbl.ForeColor = Pal.TxtSec;
+            _errorMsgLbl.Font      = Fnt.CardSub;
+            _errorMsgLbl.TextAlign = ContentAlignment.MiddleCenter;
+            _errorMsgLbl.AutoSize  = false;
+
+            var errIcon            = new Label();
+            errIcon.Text           = "⚠";
+            errIcon.Font           = new Font("Segoe UI", 28f);
+            errIcon.ForeColor      = Pal.Orange;
+            errIcon.AutoSize       = true;
+
+            _retryBtn              = new SteamButton();
+            _retryBtn.Text         = "Try Again";
+            _retryBtn.BaseColor    = Pal.BtnBlue;
+            _retryBtn.Size         = new Size(120, 32);
+            _retryBtn.Click       += (s, e) => FetchLibrary();
+
+            _errorPanel.Resize += (s, e) =>
+            {
+                int cx = _errorPanel.Width  / 2;
+                int cy = _errorPanel.Height / 2;
+                errIcon.Location      = new Point(cx - errIcon.Width / 2,       cy - 60);
+                _errorMsgLbl.Location = new Point(20,                            cy - 22);
+                _errorMsgLbl.Size     = new Size(_errorPanel.Width - 40,         44);
+                _retryBtn.Location    = new Point(cx - _retryBtn.Width / 2,      cy + 32);
+            };
+            _errorPanel.Controls.Add(errIcon);
+            _errorPanel.Controls.Add(_errorMsgLbl);
+            _errorPanel.Controls.Add(_retryBtn);
+
             // ── Timers ────────────────────────────────────────────────────────
             _sessionTimer          = new System.Windows.Forms.Timer();
             _sessionTimer.Interval = 1000;                // tick every second while idling
@@ -1706,6 +1922,7 @@ namespace SteamIdler
 
         async Task FetchBadgeMode()
         {
+            HideLoadError();
             if (!AppConfig.HasCookies())
             { _loadingLbl.Text = "Not logged in.\n\nOpen Settings → Browser Login."; return; }
 
@@ -1746,13 +1963,14 @@ namespace SteamIdler
             }
             catch (Exception ex)
             {
-                _loadingLbl.Text = "Badge page load failed.\n\n" + HumanizeNetworkError(ex) + "\n\nTry logging in again via Settings.";
-                if (!_listPanel.Controls.Contains(_loadingLbl)) _listPanel.Controls.Add(_loadingLbl);
+                ShowLoadError("Badge page load failed.\n" + HumanizeNetworkError(ex)
+                    + "\n\nTry logging in again via Settings.");
             }
         }
 
         async Task FetchApiMode()
         {
+            HideLoadError();
             if (!AppConfig.HasApiKey())
             { _loadingLbl.Text = "API key or SteamID not configured.\n\nOpen Settings."; return; }
 
@@ -1806,8 +2024,8 @@ namespace SteamIdler
             }
             catch (Exception ex)
             {
-                _loadingLbl.Text = "Failed to load library.\n\n" + HumanizeNetworkError(ex) + "\n\nCheck Settings.";
-                if (!_listPanel.Controls.Contains(_loadingLbl)) _listPanel.Controls.Add(_loadingLbl);
+                ShowLoadError("Failed to load library.\n" + HumanizeNetworkError(ex)
+                    + "\n\nCheck Settings.");
             }
         }
 
@@ -1897,6 +2115,13 @@ namespace SteamIdler
                     : string.Format("{0}m {1:D2}s", (int)span.TotalMinutes, span.Seconds);
                 t += "  ·  Session: " + sess;
             }
+            if (running > 0 && _nextAutoStopCheck.HasValue)
+            {
+                var rem = _nextAutoStopCheck.Value - DateTime.Now;
+                t += rem.TotalSeconds > 0
+                    ? string.Format("  ·  drop check in {0}m", (int)rem.TotalMinutes + 1)
+                    : "  ·  checking drops…";
+            }
             _statsLbl.Text = t;
         }
 
@@ -1939,7 +2164,7 @@ namespace SteamIdler
             var selected = _cards.Values.Where(c => c.Checked).Select(c => c.AppId).ToList();
             if (selected.Count == 0)
             {
-                MessageBox.Show("Check at least one game to idle.", "Nothing selected",
+                DarkDialog.Show(this, "Check at least one game to idle.", "Nothing selected",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1959,7 +2184,7 @@ namespace SteamIdler
                 .Select(c => c.AppId).ToList();
             if (withDrops.Count == 0)
             {
-                MessageBox.Show("No visible games with card drops remaining.",
+                DarkDialog.Show(this, "No visible games with card drops remaining.",
                     "Nothing to idle", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -2039,7 +2264,7 @@ namespace SteamIdler
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Could not start App " + appId.ToString() + ":\n" + ex.Message,
+                DarkDialog.Show(this, "Could not start App " + appId.ToString() + ":\n" + ex.Message,
                     "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -2112,8 +2337,16 @@ namespace SteamIdler
                                 && AppConfig.HasCookies();
             if (_autoStopTimer != null)
             {
-                if (shouldAutoStop  && !_autoStopTimer.Enabled) _autoStopTimer.Start();
-                else if (!shouldAutoStop && _autoStopTimer.Enabled) _autoStopTimer.Stop();
+                if (shouldAutoStop && !_autoStopTimer.Enabled)
+                {
+                    _autoStopTimer.Start();
+                    _nextAutoStopCheck = DateTime.Now.AddMilliseconds(_autoStopTimer.Interval);
+                }
+                else if (!shouldAutoStop && _autoStopTimer.Enabled)
+                {
+                    _autoStopTimer.Stop();
+                    _nextAutoStopCheck = null;
+                }
             }
 
             // Auto-stop checkbox is only meaningful in cookie mode
@@ -2124,7 +2357,7 @@ namespace SteamIdler
         bool CheckIdleExe()
         {
             if (File.Exists(Path.Combine(_exeDir, "steam-idle.exe"))) return true;
-            MessageBox.Show(
+            DarkDialog.Show(this,
                 "steam-idle.exe not found next to SteamIdler.exe.\n\nPlace these files in the same folder:\n" +
                 "  steam-idle.exe\n  CSteamworks.dll\n  steam_api.dll\n  Steamworks.NET.dll",
                 "Missing Files", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -2178,6 +2411,29 @@ namespace SteamIdler
 
         // ---- Helpers -------------------------------------------------------
 
+        // ---- Error panel -----------------------------------------------------------
+
+        void ShowLoadError(string msg)
+        {
+            _errorMsgLbl.Text = msg;
+            _listPanel.SuspendLayout();
+            if (_listPanel.Controls.Contains(_loadingLbl)) _listPanel.Controls.Remove(_loadingLbl);
+            if (!_listPanel.Controls.Contains(_errorPanel)) _listPanel.Controls.Add(_errorPanel);
+            _errorPanel.Visible = true;
+            _errorPanel.BringToFront();
+            _listPanel.ResumeLayout(true);
+        }
+
+        void HideLoadError()
+        {
+            if (_errorPanel.Visible)
+            {
+                _errorPanel.Visible = false;
+                if (_listPanel.Controls.Contains(_errorPanel))
+                    _listPanel.Controls.Remove(_errorPanel);
+            }
+        }
+
         // ---- Sort ------------------------------------------------------------------
 
         void ApplySort()
@@ -2224,6 +2480,9 @@ namespace SteamIdler
 
         async void CheckDropsAndAutoStop()
         {
+            // Reset countdown so the stats bar immediately reflects the new interval
+            _nextAutoStopCheck = DateTime.Now.AddMilliseconds(_autoStopTimer.Interval);
+
             if (!AppConfig.AutoStop
                 || _procs.Count == 0
                 || AppConfig.AuthMode != AppConfig.ModeCookies
@@ -2314,7 +2573,7 @@ namespace SteamIdler
             var mutex = new Mutex(true, "SteamCardIdler_SingleInstance", out createdNew);
             if (!createdNew)
             {
-                MessageBox.Show(
+                DarkDialog.Show(
                     "Steam Card Idler is already running.\nCheck the system tray.",
                     "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
@@ -2325,7 +2584,7 @@ namespace SteamIdler
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) =>
             {
-                MessageBox.Show(
+                DarkDialog.Show(
                     "An unexpected error occurred:\n\n" + e.Exception.Message,
                     "Steam Card Idler — Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             };
@@ -2334,7 +2593,7 @@ namespace SteamIdler
             {
                 var ex  = e.ExceptionObject as Exception;
                 string msg = ex != null ? ex.Message : e.ExceptionObject.ToString();
-                MessageBox.Show(
+                DarkDialog.Show(
                     "A fatal error occurred:\n\n" + msg,
                     "Steam Card Idler — Fatal Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             };
